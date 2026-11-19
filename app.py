@@ -12,7 +12,7 @@ app = Flask(__name__)
 # ---------------------------------------------------------------
 # Configurações
 # ---------------------------------------------------------------
-TIMEOUT = (10, 45)             # (connect, read) — 45s para caber no maxDuration=60 da Vercel
+TIMEOUT = (10, 45)             # (connect, read)
 CHUNK_SIZE = 64 * 1024         # 64 KB por chunk no streaming
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -23,35 +23,27 @@ USER_AGENT = (
 # ---------------------------------------------------------------
 # Whitelist de domínios permitidos
 # ---------------------------------------------------------------
-# Configure via variável de ambiente na Vercel:
-#   ALLOWED_DOMAINS = "origem.com,cdn.origem.com"
-# Se vazio, o proxy aceita qualquer domínio (NÃO recomendado em produção).
+# ALLOWED_DOMAINS  -> domínios de ORIGEM que o proxy pode acessar
+# ALLOWED_REFERERS -> domínios permitidos como REFERER (se o referer for enviado)
 _env_allowed = os.environ.get("ALLOWED_DOMAINS", "").strip()
 ALLOWED_DOMAINS = {
-    d.strip().lower()
-    for d in _env_allowed.split(",")
-    if d.strip()
+    d.strip().lower() for d in _env_allowed.split(",") if d.strip()
 }
 
-# Domínios permitidos como "referer" (domínio que tem permissão na origem).
-# Se vazio, aceita qualquer referer (mas ainda valida formato).
 _env_referers = os.environ.get("ALLOWED_REFERERS", "").strip()
 ALLOWED_REFERERS = {
-    d.strip().lower()
-    for d in _env_referers.split(",")
-    if d.strip()
+    d.strip().lower() for d in _env_referers.split(",") if d.strip()
 }
 
 
 # ---------------------------------------------------------------
-# Utilitários de segurança
+# Utilitários
 # ---------------------------------------------------------------
 def is_private_host(hostname: str) -> bool:
-    """Retorna True se o hostname resolve para IP privado/loopback/link-local."""
     try:
         infos = socket.getaddrinfo(hostname, None)
     except socket.gaierror:
-        return True  # se não resolve, bloqueia
+        return True
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
         if (ip.is_private or ip.is_loopback or ip.is_link_local
@@ -61,7 +53,6 @@ def is_private_host(hostname: str) -> bool:
 
 
 def host_matches(hostname: str, allowed: set) -> bool:
-    """Verifica se hostname é igual ou subdomínio de algum domínio da lista."""
     hostname = hostname.lower()
     for d in allowed:
         if hostname == d or hostname.endswith("." + d):
@@ -70,7 +61,6 @@ def host_matches(hostname: str, allowed: set) -> bool:
 
 
 def validate_url(url: str):
-    """Valida protocolo e destino (anti-SSRF + whitelist de domínios)."""
     p = urlparse(url)
     if p.scheme not in ("http", "https"):
         abort(403, "Somente http/https são permitidos")
@@ -83,7 +73,7 @@ def validate_url(url: str):
 
 
 def validate_referer(referer: str):
-    """Valida se o referer pertence a um domínio permitido (se a lista existir)."""
+    """Só valida se o referer foi informado."""
     if not referer:
         return
     p = urlparse(referer)
@@ -94,7 +84,6 @@ def validate_referer(referer: str):
 
 
 def build_referer(raw: str) -> str:
-    """Normaliza o parâmetro referer para uma URL completa."""
     if not raw:
         return ""
     raw = raw.strip()
@@ -104,19 +93,19 @@ def build_referer(raw: str) -> str:
 
 
 def proxy_url(abs_url: str, referer: str) -> str:
-    """Monta a URL apontando de volta para este proxy."""
-    qs = urlencode({"url": abs_url, "referer": referer})
-    return f"/proxy?{qs}"
+    params = {"url": abs_url}
+    if referer:
+        params["referer"] = referer
+    return "/proxy?" + urlencode(params)
 
 
 # ---------------------------------------------------------------
-# Reescreve playlists M3U8 (HLS)
+# Reescreve playlists M3U8
 # ---------------------------------------------------------------
 URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
 
 
 def rewrite_playlist(body: str, base_url: str, referer: str) -> str:
-    """Reescreve segmentos e atributos URI="..." para passarem pelo proxy."""
     out_lines = []
     for raw_line in body.splitlines():
         line = raw_line.strip()
@@ -139,7 +128,7 @@ def rewrite_playlist(body: str, base_url: str, referer: str) -> str:
 
 
 # ---------------------------------------------------------------
-# Handler de erros (para devolver texto simples, não HTML)
+# Handler de erros
 # ---------------------------------------------------------------
 @app.errorhandler(400)
 @app.errorhandler(403)
@@ -161,24 +150,22 @@ def proxy():
     target = request.args.get("url", "").strip()
     raw_referer = request.args.get("referer", "").strip()
 
-    # --- Validação dos parâmetros obrigatórios ---
+    # url é obrigatório; referer é OPCIONAL
     if not target:
         abort(403, "Parâmetro 'url' é obrigatório")
-    if not raw_referer:
-        abort(403, "Parâmetro 'referer' é obrigatório")
 
     referer = build_referer(raw_referer)
 
-    # --- Validações de segurança ---
     validate_url(target)
-    validate_referer(referer)
+    validate_referer(referer)  # só valida se referer foi informado
 
-    # --- Cabeçalhos a enviar ao servidor de origem ---
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "*/*",
         "Accept-Encoding": "identity",
     }
+    # Só envia Referer/Origin se o cliente informou um referer.
+    # Sem referer, o proxy se comporta como acesso anônimo.
     if referer:
         headers["Referer"] = referer
         p = urlparse(referer)
@@ -187,7 +174,6 @@ def proxy():
     if request.headers.get("Range"):
         headers["Range"] = request.headers["Range"]
 
-    # --- Requisição upstream ---
     try:
         upstream = requests.get(
             target, headers=headers, stream=True, timeout=TIMEOUT, allow_redirects=True
@@ -246,36 +232,8 @@ def proxy():
 
 
 # ---------------------------------------------------------------
-# Página de teste com hls.js (opcional)
+# Health check (sem HTML, sem mensagem de teste)
 # ---------------------------------------------------------------
 @app.route("/")
 def index():
-    return """
-    <!doctype html>
-    <html><head><meta charset="utf-8"><title>HLS Proxy Test</title></head>
-    <body style="background:#111;color:#eee;font-family:sans-serif;padding:20px">
-      <h3>Teste do Proxy HLS</h3>
-      <p>Abra:</p>
-      <code id="u"></code>
-      <br><br>
-      <video id="v" controls autoplay style="width:80%;max-width:900px;background:#000"></video>
-
-      <script src="https://cdn.jsdelivr.net/npm/hls.js@latest"></script>
-      <script>
-        const origem  = "https://servidor-origem.com/video/master.m3u8";
-        const referer = "dominioautorizado.com";
-        const src = "/proxy?url=" + encodeURIComponent(origem) +
-                    "&referer=" + encodeURIComponent(referer);
-        document.getElementById("u").textContent = src;
-
-        const video = document.getElementById("v");
-        if (Hls.isSupported()) {
-          const hls = new Hls();
-          hls.loadSource(src);
-          hls.attachMedia(video);
-        } else {
-          video.src = src;
-        }
-      </script>
-    </body></html>
-    """
+    return {"status": "ok"}
