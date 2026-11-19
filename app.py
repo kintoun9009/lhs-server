@@ -12,7 +12,7 @@ app = Flask(__name__)
 # ---------------------------------------------------------------
 # Configurações
 # ---------------------------------------------------------------
-TIMEOUT = (10, 45)             # (connect, read)
+TIMEOUT = (10, 45)             # (connect, read) — 45s para caber no maxDuration=60 da Vercel
 CHUNK_SIZE = 64 * 1024         # 64 KB por chunk no streaming
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -23,27 +23,35 @@ USER_AGENT = (
 # ---------------------------------------------------------------
 # Whitelist de domínios permitidos
 # ---------------------------------------------------------------
-# ALLOWED_DOMAINS  -> domínios de ORIGEM que o proxy pode acessar
-# ALLOWED_REFERERS -> domínios permitidos como REFERER (se o referer for enviado)
+# Configure via variável de ambiente na Vercel:
+#   ALLOWED_DOMAINS = "origem.com,cdn.origem.com"
+# Se vazio, o proxy aceita qualquer domínio (NÃO recomendado em produção).
 _env_allowed = os.environ.get("ALLOWED_DOMAINS", "").strip()
 ALLOWED_DOMAINS = {
-    d.strip().lower() for d in _env_allowed.split(",") if d.strip()
+    d.strip().lower()
+    for d in _env_allowed.split(",")
+    if d.strip()
 }
 
+# Domínios permitidos como "referer" (domínio que tem permissão na origem).
+# Se vazio, aceita qualquer referer (mas ainda valida formato).
 _env_referers = os.environ.get("ALLOWED_REFERERS", "").strip()
 ALLOWED_REFERERS = {
-    d.strip().lower() for d in _env_referers.split(",") if d.strip()
+    d.strip().lower()
+    for d in _env_referers.split(",")
+    if d.strip()
 }
 
 
 # ---------------------------------------------------------------
-# Utilitários
+# Utilitários de segurança
 # ---------------------------------------------------------------
 def is_private_host(hostname: str) -> bool:
+    """Retorna True se o hostname resolve para IP privado/loopback/link-local."""
     try:
         infos = socket.getaddrinfo(hostname, None)
     except socket.gaierror:
-        return True
+        return True  # se não resolve, bloqueia
     for info in infos:
         ip = ipaddress.ip_address(info[4][0])
         if (ip.is_private or ip.is_loopback or ip.is_link_local
@@ -53,6 +61,7 @@ def is_private_host(hostname: str) -> bool:
 
 
 def host_matches(hostname: str, allowed: set) -> bool:
+    """Verifica se hostname é igual ou subdomínio de algum domínio da lista."""
     hostname = hostname.lower()
     for d in allowed:
         if hostname == d or hostname.endswith("." + d):
@@ -61,6 +70,7 @@ def host_matches(hostname: str, allowed: set) -> bool:
 
 
 def validate_url(url: str):
+    """Valida protocolo e destino (anti-SSRF + whitelist de domínios)."""
     p = urlparse(url)
     if p.scheme not in ("http", "https"):
         abort(403, "Somente http/https são permitidos")
@@ -73,7 +83,7 @@ def validate_url(url: str):
 
 
 def validate_referer(referer: str):
-    """Só valida se o referer foi informado."""
+    """Valida se o referer pertence a um domínio permitido (se a lista existir)."""
     if not referer:
         return
     p = urlparse(referer)
@@ -84,6 +94,7 @@ def validate_referer(referer: str):
 
 
 def build_referer(raw: str) -> str:
+    """Normaliza o parâmetro referer para uma URL completa."""
     if not raw:
         return ""
     raw = raw.strip()
@@ -93,19 +104,19 @@ def build_referer(raw: str) -> str:
 
 
 def proxy_url(abs_url: str, referer: str) -> str:
-    params = {"url": abs_url}
-    if referer:
-        params["referer"] = referer
-    return "/proxy?" + urlencode(params)
+    """Monta a URL apontando de volta para este proxy."""
+    qs = urlencode({"url": abs_url, "referer": referer})
+    return f"/proxy?{qs}"
 
 
 # ---------------------------------------------------------------
-# Reescreve playlists M3U8
+# Reescreve playlists M3U8 (HLS)
 # ---------------------------------------------------------------
 URI_ATTR_RE = re.compile(r'URI="([^"]+)"')
 
 
 def rewrite_playlist(body: str, base_url: str, referer: str) -> str:
+    """Reescreve segmentos e atributos URI="..." para passarem pelo proxy."""
     out_lines = []
     for raw_line in body.splitlines():
         line = raw_line.strip()
@@ -128,7 +139,7 @@ def rewrite_playlist(body: str, base_url: str, referer: str) -> str:
 
 
 # ---------------------------------------------------------------
-# Handler de erros
+# Handler de erros (para devolver texto simples, não HTML)
 # ---------------------------------------------------------------
 @app.errorhandler(400)
 @app.errorhandler(403)
@@ -150,22 +161,24 @@ def proxy():
     target = request.args.get("url", "").strip()
     raw_referer = request.args.get("referer", "").strip()
 
-    # url é obrigatório; referer é OPCIONAL
+    # --- Validação dos parâmetros obrigatórios ---
     if not target:
         abort(403, "Parâmetro 'url' é obrigatório")
+    if not raw_referer:
+        abort(403, "Parâmetro 'referer' é obrigatório")
 
     referer = build_referer(raw_referer)
 
+    # --- Validações de segurança ---
     validate_url(target)
-    validate_referer(referer)  # só valida se referer foi informado
+    validate_referer(referer)
 
+    # --- Cabeçalhos a enviar ao servidor de origem ---
     headers = {
         "User-Agent": USER_AGENT,
         "Accept": "*/*",
         "Accept-Encoding": "identity",
     }
-    # Só envia Referer/Origin se o cliente informou um referer.
-    # Sem referer, o proxy se comporta como acesso anônimo.
     if referer:
         headers["Referer"] = referer
         p = urlparse(referer)
@@ -174,6 +187,7 @@ def proxy():
     if request.headers.get("Range"):
         headers["Range"] = request.headers["Range"]
 
+    # --- Requisição upstream ---
     try:
         upstream = requests.get(
             target, headers=headers, stream=True, timeout=TIMEOUT, allow_redirects=True
@@ -229,11 +243,3 @@ def proxy():
         status=status,
         headers=resp_headers,
     )
-
-
-# ---------------------------------------------------------------
-# Health check (sem HTML, sem mensagem de teste)
-# ---------------------------------------------------------------
-@app.route("/")
-def index():
-    return {"status": "ok"}
