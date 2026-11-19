@@ -26,7 +26,7 @@ USER_AGENT = (
 # Configure via variável de ambiente na Vercel:
 #   ALLOWED_DOMAINS = "origem.com,cdn.origem.com"
 # Se vazio, o proxy aceita qualquer domínio (NÃO recomendado em produção).
-_env_allowed = os.environ.get("ALLOWED_DOMAINS", "ANIBUNKER").strip()
+_env_allowed = os.environ.get("ALLOWED_DOMAINS", "").strip()
 ALLOWED_DOMAINS = {
     d.strip().lower()
     for d in _env_allowed.split(",")
@@ -35,7 +35,7 @@ ALLOWED_DOMAINS = {
 
 # Domínios permitidos como "referer" (domínio que tem permissão na origem).
 # Se vazio, aceita qualquer referer (mas ainda valida formato).
-_env_referers = os.environ.get("ALLOWED_REFERERS", "ANIBUNKER").strip()
+_env_referers = os.environ.get("ALLOWED_REFERERS", "").strip()
 ALLOWED_REFERERS = {
     d.strip().lower()
     for d in _env_referers.split(",")
